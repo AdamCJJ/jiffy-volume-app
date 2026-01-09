@@ -1,9 +1,14 @@
 import "dotenv/config";
+import dns from "dns";
+dns.setDefaultResultOrder("ipv4first");
+
 import express from "express";
 import session from "express-session";
 import multer from "multer";
 import OpenAI from "openai";
 import { insertEstimate, listEstimates, getEstimate } from "./db.js";
+import path from "path";
+import { fileURLToPath } from "url";
 
 const app = express();
 const upload = multer({ limits: { fileSize: 15 * 1024 * 1024 } }); // 15MB per image
@@ -12,10 +17,14 @@ const APP_PIN = process.env.APP_PIN;
 if (!APP_PIN) throw new Error("Missing APP_PIN env var");
 
 const SESSION_SECRET = process.env.SESSION_SECRET || "dev-secret-change-me";
-const MODEL_NAME = process.env.MODEL_NAME || "gpt-5"; // can set to gpt-4.1-mini if desired
+const MODEL_NAME = process.env.MODEL_NAME || "gpt-5";
+const PORT = process.env.PORT || 3000;
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 if (!process.env.OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY env var");
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 app.use(
   session({
@@ -26,13 +35,22 @@ app.use(
     cookie: {
       httpOnly: true,
       sameSite: "lax",
-      secure: process.env.COOKIE_SECURE === "true"
+      // On Render, HTTPS is used at the public URL, but setting secure cookies can be finicky during debugging.
+      // Leave this false unless you are 100% sure cookies are being set correctly.
+      secure: String(process.env.COOKIE_SECURE || "false") === "true"
     }
   })
 );
 
 app.use(express.json());
-app.use(express.static("public"));
+
+// Serve static assets from /public
+app.use(express.static(path.join(__dirname, "public")));
+
+// Force / to serve index.html (prevents "Cannot GET /" confusion)
+app.get("/", (req, res) => {
+  res.sendFile(path.join(__dirname, "public", "index.html"));
+});
 
 function requireAuth(req, res, next) {
   if (req.session?.authed) return next();
@@ -41,7 +59,7 @@ function requireAuth(req, res, next) {
 
 app.post("/api/login", (req, res) => {
   const { pin } = req.body || {};
-  if (pin && String(pin) === String(APP_PIN)) {
+  if (pin && String(pin).trim() === String(APP_PIN).trim()) {
     req.session.authed = true;
     res.json({ ok: true });
     return;
@@ -68,7 +86,9 @@ Job types:
 - DUMPSTER_OVERFLOW: estimate volume being removed INCLUDING debris around the dumpster and overflow on top, plus removal "arms-length into the dumpster" so the dumpster is not overflowing afterward. Do NOT count deeper contents beyond arms-length. The dumpster container stays onsite and must NEVER be counted.
 
 Dumpster size:
-- If job_type is DUMPSTER_CLEANOUT or DUMPSTER_OVERFLOW and dumpster_size is UNKNOWN, ask exactly one question: "What size dumpster is it (2, 4, 6, 8, or 10 yard)?" and do not provide an estimate until answered.
+- If job_type is DUMPSTER_CLEANOUT or DUMPSTER_OVERFLOW and dumpster_size is UNKNOWN, ask exactly one question:
+  "What size dumpster is it (2, 4, 6, 8, or 10 yard)?"
+  and do not provide an estimate until answered.
 
 Output format (must follow exactly):
 Estimated Volume: X–Y cubic yards
@@ -86,7 +106,7 @@ app.post("/api/estimate", requireAuth, upload.array("photos", 12), async (req, r
     const job_type = (req.body.job_type || "STANDARD").toUpperCase();
     const dumpster_size_raw = (req.body.dumpster_size || "").trim();
     const dumpster_size =
-      dumpster_size_raw === "" || dumpster_size_raw === "UNKNOWN"
+      dumpster_size_raw === "" || dumpster_size_raw.toUpperCase() === "UNKNOWN"
         ? null
         : Number(dumpster_size_raw);
 
@@ -99,6 +119,7 @@ app.post("/api/estimate", requireAuth, upload.array("photos", 12), async (req, r
       return;
     }
 
+    // Build multimodal input
     const inputParts = [];
     inputParts.push({
       type: "input_text",
@@ -131,35 +152,59 @@ app.post("/api/estimate", requireAuth, upload.array("photos", 12), async (req, r
 
     const confidence = parseConfidence(resultText);
 
-    const saved = await insertEstimate({
-      user_id: null,
-      agent_label,
-      job_type,
-      dumpster_size,
-      notes,
-      photo_count: files.length,
-      model_name: MODEL_NAME,
-      result_text: resultText,
-      confidence
-    });
+    // Save to DB (but do NOT crash the app if DB is temporarily unavailable)
+    let saved = null;
+    try {
+      saved = await insertEstimate({
+        user_id: null,
+        agent_label,
+        job_type,
+        dumpster_size,
+        notes,
+        photo_count: files.length,
+        model_name: MODEL_NAME,
+        result_text: resultText,
+        confidence
+      });
+    } catch {
+      // If DB is down, we still return the estimate; history logging can recover later.
+      saved = { id: null, created_at: null };
+    }
 
-    res.json({ ok: true, id: saved.id, created_at: saved.created_at, result: resultText });
+    res.json({
+      ok: true,
+      id: saved?.id,
+      created_at: saved?.created_at,
+      result: resultText
+    });
   } catch (e) {
     res.status(500).json({ error: e?.message || "Server error" });
   }
 });
 
 app.get("/api/history", requireAuth, async (req, res) => {
-  const limit = Math.min(Number(req.query.limit || 100), 300);
-  const rows = await listEstimates(limit);
-  res.json({ ok: true, rows });
+  try {
+    const limit = Math.min(Number(req.query.limit || 100), 300);
+    const rows = await listEstimates(limit);
+    res.json({ ok: true, rows });
+  } catch {
+    res.status(503).json({ error: "Database not reachable. Try again in a moment." });
+  }
 });
 
 app.get("/api/estimate/:id", requireAuth, async (req, res) => {
-  const row = await getEstimate(req.params.id);
-  if (!row) return res.status(404).json({ error: "Not found" });
-  res.json({ ok: true, row });
+  try {
+    const row = await getEstimate(req.params.id);
+    if (!row) return res.status(404).json({ error: "Not found" });
+    res.json({ ok: true, row });
+  } catch {
+    res.status(503).json({ error: "Database not reachable. Try again in a moment." });
+  }
 });
 
-const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Jiffy Volume App running on :${port}`));
+// Lightweight endpoint for future use (optional)
+app.get("/api/ping", (req, res) => {
+  res.json({ ok: true });
+});
+
+app.listen(PORT, () => console.log(`Jiffy Volume App running on :${PORT}`));
