@@ -47,10 +47,21 @@ async function api(path, opts) {
   return data;
 }
 
+// Auth check that does NOT depend on the database being up.
+// We only need to know whether the session is authed.
+// We'll do that by calling /api/history and accepting 503 (DB down) as "still logged in".
 async function checkAuth() {
-  // If /api/history returns 401, we assume locked
   try {
-    await api("/api/history?limit=1", { method: "GET" });
+    // First, ensure the server is reachable
+    await api("/api/ping", { method: "GET" });
+
+    // Next, check if session is authed.
+    // 401 => not logged in
+    // 503 => DB down but session may still be valid, treat as logged in so UI works
+    const r = await fetch("/api/history?limit=1");
+    if (r.status === 401) throw new Error("Not authed");
+
+    // If 200 or 503, show app
     loginCard.classList.add("hidden");
     appCard.classList.remove("hidden");
   } catch {
@@ -67,27 +78,34 @@ loginBtn.onclick = async () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ pin: pin.value })
     });
+
     pin.value = "";
-    await checkAuth();
+
+    // Switch UI immediately after successful login
+    loginCard.classList.add("hidden");
+    appCard.classList.remove("hidden");
   } catch (e) {
     loginErr.textContent = e.message;
   }
 };
 
 logoutBtn.onclick = async () => {
-  try { await api("/api/logout", { method: "POST" }); } catch {}
+  try {
+    await api("/api/logout", { method: "POST" });
+  } catch {}
   await checkAuth();
 };
 
 estimateBtn.onclick = async () => {
   savedMsg.textContent = "";
   const files = photos.files;
+
   if (!files || !files.length) {
     out.textContent = "Please upload at least 1 photo.";
     return;
   }
 
-  out.textContent = "Estimating…";
+  out.textContent = "Estimating...";
 
   const jt = getJobType();
   const form = new FormData();
@@ -101,7 +119,7 @@ estimateBtn.onclick = async () => {
   try {
     const data = await api("/api/estimate", { method: "POST", body: form });
     out.textContent = data.result;
-    savedMsg.textContent = `Saved (#${data.id})`;
+    savedMsg.textContent = data.id ? `Saved (#${data.id})` : "Saved (no history)";
   } catch (e) {
     out.textContent = `Error: ${e.message}`;
   }
