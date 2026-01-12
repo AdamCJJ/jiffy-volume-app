@@ -1,3 +1,113 @@
+import "dotenv/config";
+import dns from "dns";
+dns.setDefaultResultOrder("ipv4first");
+
+import express from "express";
+import session from "express-session";
+import multer from "multer";
+import OpenAI from "openai";
+import { insertEstimate, listEstimates, getEstimate } from "./db.js";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const app = express();
+
+// 15MB per image, up to 12 photos + 12 overlays
+const upload = multer({ limits: { fileSize: 15 * 1024 * 1024 } });
+
+const APP_PIN = process.env.APP_PIN;
+if (!APP_PIN) throw new Error("Missing APP_PIN env var");
+
+const SESSION_SECRET = process.env.SESSION_SECRET || "dev-secret-change-me";
+const MODEL_NAME = process.env.MODEL_NAME || "gpt-4.1-mini";
+const PORT = process.env.PORT || 3000;
+
+if (!process.env.OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY env var");
+const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+app.use(
+  session({
+    name: "jjva.sid",
+    secret: SESSION_SECRET,
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      sameSite: "lax",
+      secure: String(process.env.COOKIE_SECURE || "false") === "true"
+    }
+  })
+);
+
+app.use(express.json());
+
+// Serve static assets from /public
+app.use(express.static(path.join(__dirname, "public")));
+
+// Always serve index.html at /
+app.get("/", (req, res) => {
+  res.sendFile(path.join(__dirname, "public", "index.html"));
+});
+
+function requireAuth(req, res, next) {
+  if (req.session?.authed) return next();
+  res.status(401).json({ error: "Not authorized" });
+}
+
+app.post("/api/login", (req, res) => {
+  const { pin } = req.body || {};
+  if (pin && String(pin).trim() === String(APP_PIN).trim()) {
+    req.session.authed = true;
+    res.json({ ok: true });
+    return;
+  }
+  res.status(401).json({ error: "Invalid PIN" });
+});
+
+app.post("/api/logout", (req, res) => {
+  req.session.destroy(() => res.json({ ok: true }));
+});
+
+// Prompt tuned for your workflow + overlay logic
+const SYSTEM_PROMPT = `
+You are the Jiffy Junk Volume Assistant. Your job is to estimate junk removal volume in cubic yards based on uploaded photos and notes.
+
+Core rules:
+- Always estimate cubic yards.
+- Never mention price. Only estimate volume.
+- Keep answers short, professional, friendly, and efficient.
+- Do not double-count the same item across multiple photos.
+
+Overlay rules (when an overlay image is provided after a photo):
+- Green marks = INCLUDE in the estimate (count/remove).
+- Red marks = EXCLUDE from the estimate (stays/ignore).
+- If a photo has no green marks, assume everything is in-scope EXCEPT red-marked areas.
+- The dumpster container itself is NEVER counted as junk volume.
+
+Job types:
+- STANDARD: estimate all junk shown that is in scope.
+- DUMPSTER_CLEANOUT: estimate total volume being removed INCLUDING debris around the dumpster, overflow on top, and contents removed from inside the dumpster. The dumpster container stays onsite and must NEVER be counted.
+- DUMPSTER_OVERFLOW: estimate volume being removed INCLUDING debris around the dumpster and overflow on top, plus removal "arms-length into the dumpster" so the dumpster is not overflowing afterward. Do NOT count deeper contents beyond arms-length. The dumpster container stays onsite and must NEVER be counted.
+
+Dumpster size:
+- If job_type is DUMPSTER_CLEANOUT or DUMPSTER_OVERFLOW and dumpster_size is UNKNOWN, ask exactly one question:
+  "What size dumpster is it (2, 4, 6, 8, or 10 yard)?"
+  and do not provide an estimate until answered.
+
+Output format (must follow exactly):
+Estimated Volume: X–Y cubic yards
+Confidence: Low | Medium | High
+Notes: one short sentence or None
+`.trim();
+
+function parseConfidence(resultText) {
+  const m = resultText.match(/Confidence:\s*(Low|Medium|High)/i);
+  return m ? m[1][0].toUpperCase() + m[1].slice(1).toLowerCase() : null;
+}
+
 app.post(
   "/api/estimate",
   requireAuth,
@@ -8,6 +118,7 @@ app.post(
   async (req, res) => {
     try {
       const job_type = (req.body.job_type || "STANDARD").toUpperCase();
+
       const dumpster_size_raw = (req.body.dumpster_size || "").trim();
       const dumpster_size =
         dumpster_size_raw === "" || dumpster_size_raw.toUpperCase() === "UNKNOWN"
@@ -34,18 +145,13 @@ app.post(
           `Job type: ${job_type}\n` +
           `Dumpster size: ${dumpster_size ? dumpster_size + " yard" : "UNKNOWN"}\n` +
           `Agent label: ${agent_label || "None"}\n` +
-          `Notes: ${notes || "None"}\n\n` +
-          `Overlay rules (if provided after a photo):\n` +
-          `- Green marks = INCLUDE in estimate (count/remove)\n` +
-          `- Red marks = EXCLUDE from estimate (stays/ignore)\n` +
-          `- If a photo has no green marks, assume everything is in-scope EXCEPT red-marked areas.\n` +
-          `- The dumpster container itself should NEVER be counted as junk volume.\n`
+          `Notes: ${notes || "None"}`
       });
 
       for (let i = 0; i < photos.length; i++) {
         const p = photos[i];
 
-        // The original photo
+        // Original photo
         inputParts.push({
           type: "input_text",
           text: `Photo ${i + 1} (original)`
@@ -56,7 +162,7 @@ app.post(
           image_url: `data:${p.mimetype};base64,${p.buffer.toString("base64")}`
         });
 
-        // Matching overlay, if present
+        // Matching overlay if present
         const ov = overlays[i];
         if (ov) {
           inputParts.push({
@@ -115,3 +221,30 @@ app.post(
     }
   }
 );
+
+app.get("/api/history", requireAuth, async (req, res) => {
+  try {
+    const limit = Math.min(Number(req.query.limit || 100), 300);
+    const rows = await listEstimates(limit);
+    res.json({ ok: true, rows });
+  } catch {
+    res.status(503).json({ error: "Database not reachable. Try again in a moment." });
+  }
+});
+
+app.get("/api/estimate/:id", requireAuth, async (req, res) => {
+  try {
+    const row = await getEstimate(req.params.id);
+    if (!row) return res.status(404).json({ error: "Not found" });
+    res.json({ ok: true, row });
+  } catch {
+    res.status(503).json({ error: "Database not reachable. Try again in a moment." });
+  }
+});
+
+// Used by frontend to confirm server is reachable without depending on DB
+app.get("/api/ping", (req, res) => {
+  res.json({ ok: true });
+});
+
+app.listen(PORT, () => console.log(`Jiffy Volume App running on :${PORT}`));
