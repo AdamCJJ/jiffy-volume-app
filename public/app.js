@@ -8,15 +8,18 @@ const loginErr = document.getElementById("loginErr");
 const out = document.getElementById("out");
 const copyBtn = document.getElementById("copyBtn");
 const savedMsg = document.getElementById("savedMsg");
-const hint = document.getElementById("hint");
 
 const estimateBtn = document.getElementById("estimateBtn");
-const photos = document.getElementById("photos");
+const photosInput = document.getElementById("photos");
 const notes = document.getElementById("notes");
 const agentLabel = document.getElementById("agentLabel");
 
 const dumpsterBox = document.getElementById("dumpsterBox");
 const dumpsterSize = document.getElementById("dumpsterSize");
+
+const markups = document.getElementById("markups");
+
+let editors = []; // { file, imgEl, canvas, ctx, mode, drawing, lastX, lastY }
 
 function getJobType() {
   const r = document.querySelector("input[name='jobType']:checked");
@@ -26,19 +29,8 @@ function getJobType() {
 function updateDumpsterUI() {
   const jt = getJobType();
   dumpsterBox.classList.toggle("hidden", jt === "STANDARD");
-
-  const count = (photos.files || []).length;
-  if (count === 1) {
-    hint.textContent = "Tip: 2+ angles improves accuracy.";
-  } else {
-    hint.textContent = "";
-  }
 }
-
-document.querySelectorAll("input[name='jobType']").forEach(el => {
-  el.addEventListener("change", updateDumpsterUI);
-});
-photos.addEventListener("change", updateDumpsterUI);
+document.querySelectorAll("input[name='jobType']").forEach(el => el.addEventListener("change", updateDumpsterUI));
 
 async function api(path, opts) {
   const res = await fetch(path, opts);
@@ -47,21 +39,11 @@ async function api(path, opts) {
   return data;
 }
 
-// Auth check that does NOT depend on the database being up.
-// We only need to know whether the session is authed.
-// We'll do that by calling /api/history and accepting 503 (DB down) as "still logged in".
 async function checkAuth() {
   try {
-    // First, ensure the server is reachable
     await api("/api/ping", { method: "GET" });
-
-    // Next, check if session is authed.
-    // 401 => not logged in
-    // 503 => DB down but session may still be valid, treat as logged in so UI works
     const r = await fetch("/api/history?limit=1");
     if (r.status === 401) throw new Error("Not authed");
-
-    // If 200 or 503, show app
     loginCard.classList.add("hidden");
     appCard.classList.remove("hidden");
   } catch {
@@ -78,10 +60,7 @@ loginBtn.onclick = async () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ pin: pin.value })
     });
-
     pin.value = "";
-
-    // Switch UI immediately after successful login
     loginCard.classList.add("hidden");
     appCard.classList.remove("hidden");
   } catch (e) {
@@ -90,17 +69,186 @@ loginBtn.onclick = async () => {
 };
 
 logoutBtn.onclick = async () => {
-  try {
-    await api("/api/logout", { method: "POST" });
-  } catch {}
+  try { await api("/api/logout", { method: "POST" }); } catch {}
   await checkAuth();
 };
 
+function makeEditor(file, index) {
+  const card = document.createElement("div");
+  card.className = "markupCard";
+
+  const top = document.createElement("div");
+  top.className = "markupTop";
+
+  const title = document.createElement("div");
+  title.innerHTML = `<b>Photo ${index + 1}</b> <span class="small">${file.name || ""}</span>`;
+
+  const btns = document.createElement("div");
+  btns.className = "modeBtns";
+
+  const greenBtn = document.createElement("button");
+  greenBtn.type = "button";
+  greenBtn.className = "mode green active";
+  greenBtn.textContent = "Include (green)";
+
+  const redBtn = document.createElement("button");
+  redBtn.type = "button";
+  redBtn.className = "mode red";
+  redBtn.textContent = "Exclude (red)";
+
+  const clearBtn = document.createElement("button");
+  clearBtn.type = "button";
+  clearBtn.className = "mode";
+  clearBtn.textContent = "Clear marks";
+
+  btns.appendChild(greenBtn);
+  btns.appendChild(redBtn);
+  btns.appendChild(clearBtn);
+
+  top.appendChild(title);
+  top.appendChild(btns);
+
+  const wrap = document.createElement("div");
+  wrap.className = "canvasWrap";
+
+  const img = document.createElement("img");
+  img.alt = "uploaded photo";
+
+  const canvas = document.createElement("canvas");
+  const ctx = canvas.getContext("2d");
+
+  wrap.appendChild(img);
+  wrap.appendChild(canvas);
+
+  card.appendChild(top);
+  card.appendChild(wrap);
+  markups.appendChild(card);
+
+  const editor = {
+    file,
+    imgEl: img,
+    canvas,
+    ctx,
+    mode: "include", // include=green, exclude=red
+    drawing: false,
+    lastX: 0,
+    lastY: 0
+  };
+
+  function setMode(m) {
+    editor.mode = m;
+    if (m === "include") {
+      greenBtn.classList.add("active");
+      redBtn.classList.remove("active");
+    } else {
+      redBtn.classList.add("active");
+      greenBtn.classList.remove("active");
+    }
+  }
+
+  greenBtn.onclick = () => setMode("include");
+  redBtn.onclick = () => setMode("exclude");
+  clearBtn.onclick = () => {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+  };
+
+  function resizeCanvasToImage() {
+    // Use natural image size for crisp overlays
+    canvas.width = img.naturalWidth;
+    canvas.height = img.naturalHeight;
+  }
+
+  img.onload = () => {
+    resizeCanvasToImage();
+  };
+
+  // load image from file
+  const url = URL.createObjectURL(file);
+  img.src = url;
+
+  function getXY(ev) {
+    const rect = canvas.getBoundingClientRect();
+    const x = (ev.clientX - rect.left) * (canvas.width / rect.width);
+    const y = (ev.clientY - rect.top) * (canvas.height / rect.height);
+    return { x, y };
+  }
+
+  function start(ev) {
+    editor.drawing = true;
+    const { x, y } = getXY(ev);
+    editor.lastX = x;
+    editor.lastY = y;
+  }
+
+  function move(ev) {
+    if (!editor.drawing) return;
+    const { x, y } = getXY(ev);
+
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    ctx.lineWidth = 18;
+
+    if (editor.mode === "include") {
+      ctx.strokeStyle = "rgba(0, 180, 0, 0.75)";
+    } else {
+      ctx.strokeStyle = "rgba(220, 0, 0, 0.75)";
+    }
+
+    ctx.beginPath();
+    ctx.moveTo(editor.lastX, editor.lastY);
+    ctx.lineTo(x, y);
+    ctx.stroke();
+
+    editor.lastX = x;
+    editor.lastY = y;
+  }
+
+  function end() {
+    editor.drawing = false;
+  }
+
+  canvas.addEventListener("mousedown", start);
+  canvas.addEventListener("mousemove", move);
+  window.addEventListener("mouseup", end);
+
+  // touch support
+  canvas.addEventListener("touchstart", (e) => {
+    e.preventDefault();
+    const t = e.touches[0];
+    start({ clientX: t.clientX, clientY: t.clientY });
+  }, { passive: false });
+
+  canvas.addEventListener("touchmove", (e) => {
+    e.preventDefault();
+    const t = e.touches[0];
+    move({ clientX: t.clientX, clientY: t.clientY });
+  }, { passive: false });
+
+  canvas.addEventListener("touchend", (e) => {
+    e.preventDefault();
+    end();
+  }, { passive: false });
+
+  return editor;
+}
+
+photosInput.addEventListener("change", () => {
+  markups.innerHTML = "";
+  editors = [];
+  const files = photosInput.files ? Array.from(photosInput.files) : [];
+  files.forEach((f, i) => editors.push(makeEditor(f, i)));
+});
+
+function canvasToPngBlob(canvas) {
+  return new Promise((resolve) => {
+    canvas.toBlob((blob) => resolve(blob), "image/png");
+  });
+}
+
 estimateBtn.onclick = async () => {
   savedMsg.textContent = "";
-  const files = photos.files;
-
-  if (!files || !files.length) {
+  const files = photosInput.files ? Array.from(photosInput.files) : [];
+  if (!files.length) {
     out.textContent = "Please upload at least 1 photo.";
     return;
   }
@@ -114,7 +262,16 @@ estimateBtn.onclick = async () => {
   form.append("notes", notes.value || "");
   form.append("agent_label", agentLabel.value || "");
 
+  // Attach original photos
   for (const f of files) form.append("photos", f);
+
+  // Attach overlays in same order
+  for (let i = 0; i < editors.length; i++) {
+    const ed = editors[i];
+    const blob = await canvasToPngBlob(ed.canvas);
+    // Always send overlay even if empty; backend can decide
+    form.append("overlays", blob, `overlay_${i + 1}.png`);
+  }
 
   try {
     const data = await api("/api/estimate", { method: "POST", body: form });
