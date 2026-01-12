@@ -22,7 +22,16 @@ button { padding: 10px 12px; border:1px solid var(--b); border-radius: 10px; bac
 .hint { color: var(--muted); }
 .err { color: #b00020; }
 .hidden { display:none; }
-.tableWrap { overflow:auto; }
-table { width:100%; border-collapse: collapse; margin-top: 10px; }
-th, td { border-bottom:1px solid var(--b); padding: 8px; text-align:left; font-size: 13px; }
-tr:hover { background: #f8f8ff; }
+
+.markupCard { border:1px solid var(--b); border-radius:12px; padding:12px; margin-top:12px; }
+.markupTop { display:flex; gap:10px; align-items:center; justify-content:space-between; flex-wrap:wrap; }
+.modeBtns { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+.mode { padding:8px 10px; border-radius:10px; border:1px solid var(--b); cursor:pointer; }
+.mode.green { background: #e8f7ee; }
+.mode.red { background: #fde8ea; }
+.mode.active { outline: 3px solid #111; }
+
+.canvasWrap { position: relative; margin-top: 10px; border-radius: 12px; overflow: hidden; border:1px solid var(--b); }
+.canvasWrap img { width: 100%; display:block; }
+.canvasWrap canvas { position:absolute; left:0; top:0; width:100%; height:100%; }
+.small { font-size: 12px; color: var(--muted); }
