@@ -1,3 +1,76 @@
+import "dotenv/config";
+import dns from "dns";
+dns.setDefaultResultOrder("ipv4first");
+
+import express from "express";
+import session from "express-session";
+import multer from "multer";
+import OpenAI from "openai";
+import { insertEstimate, listEstimates, getEstimate } from "./db.js";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const app = express();
+const upload = multer({ limits: { fileSize: 15 * 1024 * 1024 } }); // 15MB per image
+
+const APP_PIN = process.env.APP_PIN;
+if (!APP_PIN) throw new Error("Missing APP_PIN env var");
+
+const SESSION_SECRET = process.env.SESSION_SECRET || "dev-secret-change-me";
+const MODEL_NAME = process.env.MODEL_NAME || "gpt-5";
+const PORT = process.env.PORT || 3000;
+
+const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+if (!process.env.OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY env var");
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+app.use(
+  session({
+    name: "jjva.sid",
+    secret: SESSION_SECRET,
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      sameSite: "lax",
+      // On Render, HTTPS is used at the public URL, but setting secure cookies can be finicky during debugging.
+      // Leave this false unless you are 100% sure cookies are being set correctly.
+      secure: String(process.env.COOKIE_SECURE || "false") === "true"
+    }
+  })
+);
+
+app.use(express.json());
+
+// Serve static assets from /public
+app.use(express.static(path.join(__dirname, "public")));
+
+// Force / to serve index.html (prevents "Cannot GET /" confusion)
+app.get("/", (req, res) => {
+  res.sendFile(path.join(__dirname, "public", "index.html"));
+});
+
+function requireAuth(req, res, next) {
+  if (req.session?.authed) return next();
+  res.status(401).json({ error: "Not authorized" });
+}
+
+app.post("/api/login", (req, res) => {
+  const { pin } = req.body || {};
+  if (pin && String(pin).trim() === String(APP_PIN).trim()) {
+    req.session.authed = true;
+    res.json({ ok: true });
+    return;
+  }
+  res.status(401).json({ error: "Invalid PIN" });
+});
+
+app.post("/api/logout", (req, res) => {
+  req.session.destroy(() => res.json({ ok: true }));
+});
+
 const SYSTEM_PROMPT = `
 You are the Jiffy Junk Volume Assistant. Your job is to estimate junk removal volume in cubic yards based on uploaded photos and notes.
 
@@ -76,4 +149,155 @@ Output format (must follow exactly):
 Estimated Volume: X–Y cubic yards
 Confidence: Low | Medium | High
 Notes: one short sentence or None
-`;
+`.trim();
+
+function parseConfidence(resultText) {
+  const m = resultText.match(/Confidence:\s*(Low|Medium|High)/i);
+  return m ? m[1][0].toUpperCase() + m[1].slice(1).toLowerCase() : null;
+}
+
+app.post(
+  "/api/estimate",
+  requireAuth,
+  upload.fields([
+    { name: "photos", maxCount: 12 },
+    { name: "overlays", maxCount: 12 }
+  ]),
+  async (req, res) => {
+    try {
+      const job_type = (req.body.job_type || "STANDARD").toUpperCase();
+      const dumpster_size_raw = (req.body.dumpster_size || "").trim();
+      const dumpster_size =
+        dumpster_size_raw === "" || dumpster_size_raw.toUpperCase() === "UNKNOWN"
+          ? null
+          : Number(dumpster_size_raw);
+
+      const agent_label = (req.body.agent_label || "").trim().slice(0, 80) || null;
+      const notes = (req.body.notes || "").trim().slice(0, 4000) || null;
+
+      const photos = req.files?.photos || [];
+      const overlays = req.files?.overlays || [];
+
+      if (!photos.length) {
+        res.status(400).json({ error: "Please upload at least 1 photo." });
+        return;
+      }
+
+      // Build multimodal input
+      const inputParts = [];
+
+      inputParts.push({
+        type: "input_text",
+        text:
+          `Job type: ${job_type}\n` +
+          `Dumpster size: ${dumpster_size ? dumpster_size + " yard" : "UNKNOWN"}\n` +
+          `Agent label: ${agent_label || "None"}\n` +
+          `Notes: ${notes || "None"}\n\n` +
+          `Overlay rules (if provided after a photo):\n` +
+          `- Green marks = INCLUDE in estimate (count/remove)\n` +
+          `- Red marks = EXCLUDE from estimate (stays/ignore)\n` +
+          `- If a photo has no green marks, assume everything is in-scope EXCEPT red-marked areas.\n` +
+          `- The dumpster container itself should NEVER be counted as junk volume.\n`
+      });
+
+      for (let i = 0; i < photos.length; i++) {
+        const p = photos[i];
+
+        // The original photo
+        inputParts.push({
+          type: "input_text",
+          text: `Photo ${i + 1} (original)`
+        });
+
+        inputParts.push({
+          type: "input_image",
+          image_url: `data:${p.mimetype};base64,${p.buffer.toString("base64")}`
+        });
+
+        // Matching overlay, if present
+        const ov = overlays[i];
+        if (ov) {
+          inputParts.push({
+            type: "input_text",
+            text: `Photo ${i + 1} overlay: Green = include/count. Red = exclude/ignore.`
+          });
+
+          inputParts.push({
+            type: "input_image",
+            image_url: `data:${ov.mimetype};base64,${ov.buffer.toString("base64")}`
+          });
+        }
+      }
+
+      const response = await client.responses.create({
+        model: MODEL_NAME,
+        instructions: SYSTEM_PROMPT,
+        input: [{ role: "user", content: inputParts }],
+        max_output_tokens: 220
+      });
+
+      const resultText = (response.output_text || "").trim();
+      if (!resultText) {
+        res.status(500).json({ error: "Empty response from model." });
+        return;
+      }
+
+      const confidence = parseConfidence(resultText);
+
+      // Save to DB (but do NOT crash the app if DB is temporarily unavailable)
+      let saved = null;
+      try {
+        saved = await insertEstimate({
+          user_id: null,
+          agent_label,
+          job_type,
+          dumpster_size,
+          notes,
+          photo_count: photos.length,
+          model_name: MODEL_NAME,
+          result_text: resultText,
+          confidence
+        });
+      } catch {
+        // If DB is down, we still return the estimate; history logging can recover later.
+        saved = { id: null, created_at: null };
+      }
+
+      res.json({
+        ok: true,
+        id: saved?.id,
+        created_at: saved?.created_at,
+        result: resultText
+      });
+    } catch (e) {
+      res.status(500).json({ error: e?.message || "Server error" });
+    }
+  }
+);
+
+app.get("/api/history", requireAuth, async (req, res) => {
+  try {
+    const limit = Math.min(Number(req.query.limit || 100), 300);
+    const rows = await listEstimates(limit);
+    res.json({ ok: true, rows });
+  } catch {
+    res.status(503).json({ error: "Database not reachable. Try again in a moment." });
+  }
+});
+
+app.get("/api/estimate/:id", requireAuth, async (req, res) => {
+  try {
+    const row = await getEstimate(req.params.id);
+    if (!row) return res.status(404).json({ error: "Not found" });
+    res.json({ ok: true, row });
+  } catch {
+    res.status(503).json({ error: "Database not reachable. Try again in a moment." });
+  }
+});
+
+// Lightweight endpoint for future use (optional)
+app.get("/api/ping", (req, res) => {
+  res.json({ ok: true });
+});
+
+app.listen(PORT, () => console.log(`Jiffy Volume App running on :${PORT}`));
