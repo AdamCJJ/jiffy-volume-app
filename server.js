@@ -11,22 +11,24 @@ import path from "path";
 import { fileURLToPath } from "url";
 
 const app = express();
+app.set("trust proxy", 1);
 
-// 15MB per image, up to 12 photos + 12 overlays
 const upload = multer({ limits: { fileSize: 15 * 1024 * 1024 } });
 
 const APP_PIN = process.env.APP_PIN;
-if (!APP_PIN) throw new Error("Missing APP_PIN env var");
-
-const SESSION_SECRET = process.env.SESSION_SECRET || "dev-secret-change-me";
+const SESSION_SECRET = process.env.SESSION_SECRET || "jjva-secret";
 const MODEL_NAME = process.env.MODEL_NAME || "gpt-4.1-mini";
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 
-if (!process.env.OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY env var");
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+if (!APP_PIN) throw new Error("Missing APP_PIN");
+if (!process.env.OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
+
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+app.use(express.json());
 
 app.use(
   session({
@@ -37,19 +39,15 @@ app.use(
     cookie: {
       httpOnly: true,
       sameSite: "lax",
-      secure: String(process.env.COOKIE_SECURE || "false") === "true"
+      secure: true
     }
   })
 );
 
-app.use(express.json());
-
-// Serve static assets from /public
 app.use(express.static(path.join(__dirname, "public")));
 
-// Always serve index.html at /
 app.get("/", (req, res) => {
-  res.sendFile(path.join(__dirname, "public", "index.html"));
+  res.sendFile(path.join(__dirname, "public/index.html"));
 });
 
 function requireAuth(req, res, next) {
@@ -59,19 +57,18 @@ function requireAuth(req, res, next) {
 
 app.post("/api/login", (req, res) => {
   const { pin } = req.body || {};
-  if (pin && String(pin).trim() === String(APP_PIN).trim()) {
+  if (String(pin).trim() === String(APP_PIN).trim()) {
     req.session.authed = true;
     res.json({ ok: true });
-    return;
+  } else {
+    res.status(401).json({ error: "Invalid PIN" });
   }
-  res.status(401).json({ error: "Invalid PIN" });
 });
 
 app.post("/api/logout", (req, res) => {
   req.session.destroy(() => res.json({ ok: true }));
 });
 
-// Prompt tuned for your workflow + overlay logic
 const SYSTEM_PROMPT = `
 You are the Jiffy Junk Volume Assistant. Your job is to estimate junk removal volume in cubic yards based on uploaded photos and notes.
 
@@ -81,32 +78,32 @@ Core rules:
 - Keep answers short, professional, friendly, and efficient.
 - Do not double-count the same item across multiple photos.
 
-Overlay rules (when an overlay image is provided after a photo):
+Overlay rules:
 - Green marks = INCLUDE in the estimate (count/remove).
 - Red marks = EXCLUDE from the estimate (stays/ignore).
-- If a photo has no green marks, assume everything is in-scope EXCEPT red-marked areas.
-- The dumpster container itself is NEVER counted as junk volume.
+- If no green marks exist, assume everything is in scope except red.
+- The dumpster container, carts, and rolltainers themselves are NEVER counted.
+
+Special containers:
+- A full rolltainer = about 2 cubic yards of debris.
+- A full shopping cart = about 0.25 cubic yards of debris.
+- Scale down if not full.
+- These containers stay onsite unless explicitly requested.
 
 Job types:
-- STANDARD: estimate all junk shown that is in scope.
-- DUMPSTER_CLEANOUT: estimate total volume being removed INCLUDING debris around the dumpster, overflow on top, and contents removed from inside the dumpster. The dumpster container stays onsite and must NEVER be counted.
-- DUMPSTER_OVERFLOW: estimate volume being removed INCLUDING debris around the dumpster and overflow on top, plus removal "arms-length into the dumpster" so the dumpster is not overflowing afterward. Do NOT count deeper contents beyond arms-length. The dumpster container stays onsite and must NEVER be counted.
+STANDARD: estimate all visible junk.
+DUMPSTER_CLEANOUT: remove debris around, on top, and inside the dumpster. Do NOT count the dumpster itself.
+DUMPSTER_OVERFLOW: remove debris around and on top plus arms-length inside the dumpster.
+CONTAINER_SERVICE: garbage carts only. Convert gallons to cubic yards.
 
-Dumpster size:
-- If job_type is DUMPSTER_CLEANOUT or DUMPSTER_OVERFLOW and dumpster_size is UNKNOWN, ask exactly one question:
-  "What size dumpster is it (2, 4, 6, 8, or 10 yard)?"
-  and do not provide an estimate until answered.
+If dumpster size is unknown and unclear from photo, ask:
+"What size dumpster is it (e.g., 3 yd front-load or 20 yd roll-off)?"
 
-Output format (must follow exactly):
+Output format:
 Estimated Volume: X–Y cubic yards
 Confidence: Low | Medium | High
 Notes: one short sentence or None
-`.trim();
-
-function parseConfidence(resultText) {
-  const m = resultText.match(/Confidence:\s*(Low|Medium|High)/i);
-  return m ? m[1][0].toUpperCase() + m[1].slice(1).toLowerCase() : null;
-}
+`;
 
 app.post(
   "/api/estimate",
@@ -118,117 +115,72 @@ app.post(
   async (req, res) => {
     try {
       const job_type = (req.body.job_type || "STANDARD").toUpperCase();
-
-      const dumpster_size_raw = (req.body.dumpster_size || "").trim();
-      const dumpster_size =
-        dumpster_size_raw === "" || dumpster_size_raw.toUpperCase() === "UNKNOWN"
-          ? null
-          : Number(dumpster_size_raw);
-
-      const agent_label = (req.body.agent_label || "").trim().slice(0, 80) || null;
-      const notes = (req.body.notes || "").trim().slice(0, 4000) || null;
+      const notes = (req.body.notes || "").slice(0, 4000);
+      const agent = (req.body.agent_label || "").slice(0, 80);
 
       const photos = req.files?.photos || [];
       const overlays = req.files?.overlays || [];
 
-      if (!photos.length) {
-        res.status(400).json({ error: "Please upload at least 1 photo." });
-        return;
-      }
+      if (!photos.length) return res.status(400).json({ error: "No photos uploaded" });
 
-      // Build multimodal input
-      const inputParts = [];
-
-      inputParts.push({
-        type: "input_text",
-        text:
-          `Job type: ${job_type}\n` +
-          `Dumpster size: ${dumpster_size ? dumpster_size + " yard" : "UNKNOWN"}\n` +
-          `Agent label: ${agent_label || "None"}\n` +
-          `Notes: ${notes || "None"}`
-      });
-
-      for (let i = 0; i < photos.length; i++) {
-        const p = photos[i];
-
-        // Original photo
-        inputParts.push({
+      const content = [
+        {
           type: "input_text",
-          text: `Photo ${i + 1} (original)`
-        });
+          text: `Job type: ${job_type}\nAgent: ${agent || "None"}\nNotes: ${notes || "None"}`
+        }
+      ];
 
-        inputParts.push({
+      photos.forEach((p, i) => {
+        content.push({ type: "input_text", text: `Photo ${i + 1}` });
+        content.push({
           type: "input_image",
           image_url: `data:${p.mimetype};base64,${p.buffer.toString("base64")}`
         });
 
-        // Matching overlay if present
-        const ov = overlays[i];
-        if (ov) {
-          inputParts.push({
-            type: "input_text",
-            text: `Photo ${i + 1} overlay: Green = include/count. Red = exclude/ignore.`
-          });
-
-          inputParts.push({
+        if (overlays[i]) {
+          content.push({ type: "input_text", text: `Overlay for photo ${i + 1}` });
+          content.push({
             type: "input_image",
-            image_url: `data:${ov.mimetype};base64,${ov.buffer.toString("base64")}`
+            image_url: `data:${overlays[i].mimetype};base64,${overlays[i].buffer.toString("base64")}`
           });
         }
-      }
-
-      const response = await client.responses.create({
-        model: MODEL_NAME,
-        instructions: SYSTEM_PROMPT,
-        input: [{ role: "user", content: inputParts }],
-        max_output_tokens: 220
       });
 
-      const resultText = (response.output_text || "").trim();
-      if (!resultText) {
-        res.status(500).json({ error: "Empty response from model." });
-        return;
-      }
+      const response = await openai.responses.create({
+        model: MODEL_NAME,
+        instructions: SYSTEM_PROMPT,
+        input: [{ role: "user", content }],
+        max_output_tokens: 250
+      });
 
-      const confidence = parseConfidence(resultText);
+      const text = (response.output_text || "").trim();
+      if (!text) return res.status(500).json({ error: "Empty response from model" });
 
-      // Save to DB (do not crash if DB is unavailable)
       let saved = null;
       try {
         saved = await insertEstimate({
-          user_id: null,
-          agent_label,
+          agent_label: agent,
           job_type,
-          dumpster_size,
           notes,
           photo_count: photos.length,
           model_name: MODEL_NAME,
-          result_text: resultText,
-          confidence
+          result_text: text
         });
-      } catch {
-        saved = { id: null, created_at: null };
-      }
+      } catch {}
 
-      res.json({
-        ok: true,
-        id: saved?.id,
-        created_at: saved?.created_at,
-        result: resultText
-      });
+      res.json({ ok: true, id: saved?.id, result: text });
     } catch (e) {
-      res.status(500).json({ error: e?.message || "Server error" });
+      res.status(500).json({ error: e.message || "Server error" });
     }
   }
 );
 
 app.get("/api/history", requireAuth, async (req, res) => {
   try {
-    const limit = Math.min(Number(req.query.limit || 100), 300);
-    const rows = await listEstimates(limit);
+    const rows = await listEstimates(100);
     res.json({ ok: true, rows });
   } catch {
-    res.status(503).json({ error: "Database not reachable. Try again in a moment." });
+    res.status(503).json({ error: "Database unavailable" });
   }
 });
 
@@ -238,13 +190,8 @@ app.get("/api/estimate/:id", requireAuth, async (req, res) => {
     if (!row) return res.status(404).json({ error: "Not found" });
     res.json({ ok: true, row });
   } catch {
-    res.status(503).json({ error: "Database not reachable. Try again in a moment." });
+    res.status(503).json({ error: "Database unavailable" });
   }
 });
 
-// Used by frontend to confirm server is reachable without depending on DB
-app.get("/api/ping", (req, res) => {
-  res.json({ ok: true });
-});
-
-app.listen(PORT, () => console.log(`Jiffy Volume App running on :${PORT}`));
+app.listen(PORT, () => console.log("Jiffy Volume App running on :" + PORT));
