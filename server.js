@@ -26,6 +26,9 @@ if (!process.env.OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY env var
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// Trust Railway's proxy for secure cookies
+app.set('trust proxy', 1);
+
 app.use(
   session({
     name: "jjva.sid",
