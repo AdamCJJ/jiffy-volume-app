@@ -17,7 +17,7 @@ const APP_PIN = process.env.APP_PIN;
 if (!APP_PIN) throw new Error("Missing APP_PIN env var");
 
 const SESSION_SECRET = process.env.SESSION_SECRET || "dev-secret-change-me";
-const MODEL_NAME = process.env.MODEL_NAME || "gpt-5";
+const MODEL_NAME = process.env.MODEL_NAME || "gpt-4o";
 const PORT = process.env.PORT || 3000;
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -187,7 +187,7 @@ app.post(
       const inputParts = [];
 
       inputParts.push({
-        type: "input_text",
+        type: "text",
         text:
           `Job type: ${job_type}\n` +
           `Dumpster size: ${dumpster_size ? dumpster_size + " yard" : "UNKNOWN"}\n` +
@@ -205,38 +205,44 @@ app.post(
 
         // The original photo
         inputParts.push({
-          type: "input_text",
+          type: "text",
           text: `Photo ${i + 1} (original)`
         });
 
         inputParts.push({
-          type: "input_image",
-          image_url: `data:${p.mimetype};base64,${p.buffer.toString("base64")}`
+          type: "image_url",
+          image_url: {
+            url: `data:${p.mimetype};base64,${p.buffer.toString("base64")}`
+          }
         });
 
         // Matching overlay, if present
         const ov = overlays[i];
         if (ov) {
           inputParts.push({
-            type: "input_text",
+            type: "text",
             text: `Photo ${i + 1} overlay: Green = include/count. Red = exclude/ignore.`
           });
 
           inputParts.push({
-            type: "input_image",
-            image_url: `data:${ov.mimetype};base64,${ov.buffer.toString("base64")}`
+            type: "image_url",
+            image_url: {
+              url: `data:${ov.mimetype};base64,${ov.buffer.toString("base64")}`
+            }
           });
         }
       }
 
-      const response = await client.responses.create({
+      const response = await client.chat.completions.create({
         model: MODEL_NAME,
-        instructions: SYSTEM_PROMPT,
-        input: [{ role: "user", content: inputParts }],
-        max_output_tokens: 220
+        messages: [
+          { role: "system", content: SYSTEM_PROMPT },
+          { role: "user", content: inputParts }
+        ],
+        max_tokens: 220
       });
 
-      const resultText = (response.output_text || "").trim();
+      const resultText = (response.choices[0]?.message?.content || "").trim();
       if (!resultText) {
         res.status(500).json({ error: "Empty response from model." });
         return;
