@@ -253,7 +253,9 @@ estimateBtn.onclick = async () => {
     return;
   }
 
-  out.textContent = "Estimating...";
+  out.textContent = "Analyzing images and estimating volume...";
+  estimateBtn.disabled = true;
+  estimateBtn.classList.add("loading");
 
   const jt = getJobType();
   const form = new FormData();
@@ -276,9 +278,13 @@ estimateBtn.onclick = async () => {
   try {
     const data = await api("/api/estimate", { method: "POST", body: form });
     out.textContent = data.result;
-    savedMsg.textContent = data.id ? `Saved (#${data.id})` : "Saved (no history)";
+    savedMsg.textContent = data.id ? `✓ Saved (#${data.id})` : "✓ Saved";
+    savedMsg.className = "hint saved-msg";
   } catch (e) {
     out.textContent = `Error: ${e.message}`;
+  } finally {
+    estimateBtn.disabled = false;
+    estimateBtn.classList.remove("loading");
   }
 };
 
