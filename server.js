@@ -75,7 +75,7 @@ app.post("/api/logout", (req, res) => {
 });
 
 const SYSTEM_PROMPT = `
-You are the Jiffy Junk Volume Assistant. Your job is to estimate junk removal volume in cubic yards based on uploaded photos and notes.
+You are the Jiffy Junk Volume Estimator. Your job is to estimate junk removal volume in cubic yards based on uploaded photos and notes.
 
 Core rules:
 - Always estimate cubic yards.
