@@ -52,6 +52,11 @@ body {
   font-weight: 600;
 }
 
+.logo-img {
+  height: 50px;
+  width: auto;
+}
+
 .logo-text {
   color: var(--jiffy-green);
   font-weight: 700;
