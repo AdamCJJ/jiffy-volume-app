@@ -92,31 +92,64 @@ Special container debris heuristics:
 - If a rolltainer is visible and appears full of debris, estimate debris as about 2 cubic yards per full rolltainer (scale down if not full). Rolltainer stays.
 - If a shopping cart is visible and appears full of debris, estimate debris as about 0.25 cubic yards per full cart (scale down if not full). Cart stays unless explicitly requested.
 
+SPATIAL DEPTH ANALYSIS FOR INTERIOR ROOMS (CRITICAL):
+When analyzing interior spaces (offices, rooms, buildings) with items distributed throughout:
+- AUTOMATICALLY analyze the full 3D spatial depth from foreground to background
+- Identify items at ALL depths: near (foreground), middle, and far (back wall/rear of room)
+- Use perspective cues to understand which items are closer vs farther away
+- Account for the ENTIRE room depth when estimating - don't just focus on foreground items
+- Consider floor space occupied across the full depth of the visible room
+- Items near the back wall may appear smaller due to perspective but still occupy significant volume
+
+For room cleanouts:
+1) Scan the entire image depth systematically:
+   - Foreground items (closest to camera)
+   - Middle ground items (center of room)
+   - Background items (far wall, back corners)
+
+2) Use room dimensions and perspective:
+   - Estimate room width (left to right)
+   - Estimate room depth (front to back) using floor tiles, walls, or perspective lines
+   - Estimate ceiling height using doors, windows, or standard 8-10 ft assumption
+   - Account for items distributed across the full floor area
+
+3) Identify ALL furniture and items regardless of position:
+   - Large items: cabinets, desks, refrigerators, appliances, shelving
+   - Medium items: chairs, tables, filing cabinets, carts
+   - Small items: boxes, electronics, miscellaneous debris
+   - Items against walls or in corners are just as important as central items
+
 Photo volume estimation logic (use this method every time):
 1) Identify the included debris region
 - If overlay exists, use it.
-- If no overlay, define the debris region as the main contiguous pile.
+- If no overlay and it's an interior room, assume ALL visible furniture/items are in scope
+- If no overlay and it's exterior/pile, define the debris region as the main contiguous pile.
 
 2) Choose scale references when visible
 - Use common reference objects to anchor height and size when possible:
-  - Standard door and door hardware
-  - Barstool or chair (seat and back height)
-  - Curb height
-  - Appliances or common furniture dimensions
+  - Standard door (7 ft height, 3 ft width)
+  - Windows (typical 3-5 ft)
+  - Ceiling height (8-10 ft typical)
+  - Commercial appliances/refrigerators (known dimensions)
+  - Desks (30 inches height typical)
+  - Floor tiles (12 inch standard)
 - If no reliable reference exists, use conservative assumptions and widen the range.
 
-3) Estimate footprint (length x depth) of the included region
-- Estimate how far the pile runs along a wall/hedge line and how far it extends outward toward curb/sidewalk.
-- If perspective makes depth hard, assume a smaller depth and widen the range.
+3) Estimate footprint (length x width x depth) of the included region
+- For rooms: estimate total floor area covered by items across full room depth
+- For exterior: estimate how far the pile runs along a wall/hedge and how far it extends outward
+- Use perspective and visible floor space to judge depth accurately
 
 4) Estimate average height (not peak height)
 - Use reference objects to estimate peak height, then choose an average height lower than peak.
 - Most piles have a few high spots with a lower average.
+- For rooms with varied items, consider the height distribution of all items.
 
 5) Apply a packing factor (void factor) to account for air gaps
 - Mixed bulky junk and furniture: use 0.65 to 0.8
 - Mostly boxes stacked neatly: use 0.8 to 0.95
 - Loose bags and irregular debris: use 0.6 to 0.75
+- Room cleanouts with large furniture: use 0.5 to 0.7 (more air gaps)
 
 6) Convert to cubic yards and provide a range
 - Provide a tight range if overlay is clear and scale references exist.
